@@ -14,6 +14,7 @@
 ![OpenAI](https://img.shields.io/badge/OpenAI-GPT--4o-412991?style=flat&logo=openai&logoColor=white)
 
 </div>
+<img width="1536" height="1024" alt="ChatGPT Image May 28, 2026, 10_24_09 AM" src="https://github.com/user-attachments/assets/ca3d4610-07a3-4862-9322-054aa8cb4e98" />
 
 ---
 
