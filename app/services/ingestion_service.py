@@ -22,6 +22,8 @@ def ingest_document_sync(document_id: int, user_id: int):
 
         pages = load_document(doc.file_path, doc.file_type)
         chunks = split_documents(pages)
+        if not chunks:
+            raise ValueError("No text could be extracted from this document.")
 
         for chunk in chunks:
             chunk.metadata["document_id"] = document_id

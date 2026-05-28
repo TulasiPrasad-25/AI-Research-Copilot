@@ -5,6 +5,7 @@ from app.rag.loader import Document
 from app.rag.vectorstore import similarity_search
 
 CHAT_MODEL = "gpt-4o-mini"
+MAX_CONTEXT_CHARS = 9000
 
 
 def require_api_key() -> str:
@@ -25,8 +26,9 @@ def answer_question(context: str, question: str) -> str:
                 {
                     "role": "system",
                     "content": (
-                        "You are an AI research assistant. Answer only from the provided context. "
-                        "If the answer is not in the context, say that clearly. Cite source numbers."
+                        "You are an AI research assistant using retrieval-augmented generation. "
+                        "Answer only from the provided sources. If the answer is not supported, say so. "
+                        "Cite evidence using the source labels like [S1] or [S2]."
                     ),
                 },
                 {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
@@ -39,7 +41,7 @@ def answer_question(context: str, question: str) -> str:
 
 
 def run_rag_pipeline(user_id: int, question: str) -> dict:
-    docs: list[Document] = similarity_search(user_id, question, k=5)
+    docs: list[Document] = similarity_search(user_id, question, k=6)
 
     if not docs:
         return {
@@ -47,7 +49,22 @@ def run_rag_pipeline(user_id: int, question: str) -> dict:
             "sources": [],
         }
 
-    context = "\n\n".join([f"[{index + 1}] {doc.page_content}" for index, doc in enumerate(docs)])
+    context_parts = []
+    used_chars = 0
+    for index, doc in enumerate(docs, start=1):
+        meta = doc.metadata
+        title = meta.get("document_title") or meta.get("source", "Unknown")
+        page = meta.get("page")
+        label = f"[S{index}] {title}"
+        if page:
+            label = f"{label}, page {page}"
+        block = f"{label}\n{doc.page_content}"
+        if used_chars + len(block) > MAX_CONTEXT_CHARS:
+            break
+        context_parts.append(block)
+        used_chars += len(block)
+
+    context = "\n\n".join(context_parts)
     answer = answer_question(context, question)
 
     sources = []

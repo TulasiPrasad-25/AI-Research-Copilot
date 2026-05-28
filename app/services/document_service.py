@@ -1,9 +1,10 @@
 import os
 import shutil
+from pathlib import Path
 from sqlalchemy.orm import Session
 from fastapi import HTTPException, UploadFile
 from app.models.document import Document, DocumentStatus
-from app.core.config import settings
+from app.rag.vectorstore import remove_document
 
 UPLOAD_DIR = "./uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -13,11 +14,12 @@ ALLOWED_EXTENSIONS = {".pdf", ".txt", ".docx"}
 
 
 def save_upload(db: Session, file: UploadFile, user_id: int) -> Document:
-    ext = os.path.splitext(file.filename)[1].lower()
+    safe_filename = Path(file.filename).name
+    ext = os.path.splitext(safe_filename)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"File type {ext} not supported. Use PDF, TXT, or DOCX.")
 
-    file_path = os.path.join(UPLOAD_DIR, f"{user_id}_{file.filename}")
+    file_path = os.path.join(UPLOAD_DIR, f"{user_id}_{safe_filename}")
     with open(file_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
@@ -25,7 +27,7 @@ def save_upload(db: Session, file: UploadFile, user_id: int) -> Document:
 
     doc = Document(
         title=file.filename,
-        filename=file.filename,
+        filename=safe_filename,
         file_path=file_path,
         file_type=ext.lstrip("."),
         file_size=size,
@@ -51,6 +53,7 @@ def get_document(db: Session, doc_id: int, user_id: int) -> Document:
 
 def delete_document(db: Session, doc_id: int, user_id: int):
     doc = get_document(db, doc_id, user_id)
+    remove_document(user_id, doc.id)
     if os.path.exists(doc.file_path):
         os.remove(doc.file_path)
     db.delete(doc)
