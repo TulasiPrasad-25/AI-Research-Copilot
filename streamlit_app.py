@@ -1,25 +1,16 @@
 import io
 import os
 from contextlib import contextmanager
-from pathlib import Path
 from types import SimpleNamespace
 
 import streamlit as st
-from fastapi import HTTPException
 
-st.set_page_config(page_title="AI Research Copilot", page_icon="🔬", layout="wide")
+st.set_page_config(page_title="AI Research Copilot", page_icon="AI", layout="wide")
 
-secrets_paths = [
-    Path.home() / ".streamlit" / "secrets.toml",
-    Path.cwd() / ".streamlit" / "secrets.toml",
-]
-if not any(path.exists() for path in secrets_paths):
+try:
+    streamlit_secrets = dict(st.secrets)
+except Exception:
     streamlit_secrets = {}
-else:
-    try:
-        streamlit_secrets = dict(st.secrets)
-    except Exception:
-        streamlit_secrets = {}
 
 for secret_name in ("OPENAI_API_KEY", "DATABASE_URL", "JWT_SECRET_KEY", "FAISS_INDEX_PATH"):
     if secret_name in streamlit_secrets and not os.getenv(secret_name):
@@ -37,13 +28,20 @@ from app.schemas.user import UserCreate  # noqa: E402
 from app.services import chat_service  # noqa: E402
 from app.services.auth_service import login_user, register_user  # noqa: E402
 from app.services.document_service import delete_document, get_user_documents, save_upload  # noqa: E402
-from app.tasks.ingest_document import ingest_document_sync  # noqa: E402
+from app.services.ingestion_service import ingest_document_sync  # noqa: E402
 
 Base.metadata.create_all(bind=engine)
 
-for key, value in {"user_id": None, "user": None, "session_id": None, "messages": []}.items():
+DEFAULT_SESSION_STATE = {
+    "user_id": None,
+    "user": None,
+    "session_id": None,
+    "messages": [],
+}
+
+for key, value in DEFAULT_SESSION_STATE.items():
     if key not in st.session_state:
-        st.session_state[key] = value
+        st.session_state[key] = value.copy() if isinstance(value, list) else value
 
 
 @contextmanager
@@ -62,10 +60,8 @@ def current_user(db):
 
 
 def show_error(prefix, exc):
-    if isinstance(exc, HTTPException):
-        st.error(f"{prefix}: {exc.detail}")
-    else:
-        st.error(f"{prefix}: {exc}")
+    detail = getattr(exc, "detail", None)
+    st.error(f"{prefix}: {detail or exc}")
 
 
 def auth_page():
@@ -83,6 +79,8 @@ def auth_page():
                 try:
                     login_user(db, email, password)
                     user = db.query(app.models.User).filter(app.models.User.email == email).first()
+                    if not user:
+                        raise ValueError("User was not found after login.")
                     st.session_state.user_id = user.id
                     st.session_state.user = {"email": user.email, "full_name": user.full_name}
                     st.rerun()
@@ -117,73 +115,92 @@ def load_messages(db, session_id):
     ]
 
 
+def reset_login_state():
+    for key, value in DEFAULT_SESSION_STATE.items():
+        st.session_state[key] = value.copy() if isinstance(value, list) else value
+
+
+def sidebar(db, user):
+    with st.sidebar:
+        st.markdown(f"**{user.full_name}**")
+        st.caption(user.email)
+
+        if not os.getenv("OPENAI_API_KEY"):
+            st.warning("Add OPENAI_API_KEY in Streamlit secrets before indexing documents.")
+
+        st.divider()
+        st.subheader("Upload Paper")
+        upload = st.file_uploader("PDF, TXT, or DOCX", type=["pdf", "txt", "docx"])
+        if upload and st.button("Upload & Index", type="primary"):
+            file = SimpleNamespace(filename=upload.name, file=io.BytesIO(upload.getvalue()))
+            try:
+                doc = save_upload(db, file, user.id)
+                with st.spinner("Indexing document..."):
+                    ingest_document_sync(doc.id, user.id)
+                st.success("Document indexed.")
+                st.rerun()
+            except Exception as exc:
+                show_error("Upload failed", exc)
+
+        st.divider()
+        st.subheader("Documents")
+        for doc in get_user_documents(db, user.id):
+            status_icon = {
+                DocumentStatus.INDEXED: "OK",
+                DocumentStatus.PROCESSING: "...",
+                DocumentStatus.PENDING: "-",
+                DocumentStatus.FAILED: "!",
+            }.get(doc.status, "?")
+            left, right = st.columns([5, 1])
+            left.caption(f"{status_icon} {doc.title[:36]}")
+            if right.button("Delete", key=f"delete_doc_{doc.id}"):
+                delete_document(db, doc.id, user.id)
+                st.rerun()
+            if doc.error_message:
+                st.caption(doc.error_message)
+
+        st.divider()
+        st.subheader("Chats")
+        if st.button("New Chat"):
+            session = chat_service.create_session(db, user.id, "New Chat")
+            st.session_state.session_id = session.id
+            st.session_state.messages = []
+            st.rerun()
+
+        for session in chat_service.get_user_sessions(db, user.id):
+            label = session.title[:32]
+            if session.id == st.session_state.session_id:
+                label = f"> {label}"
+            if st.button(label, key=f"session_{session.id}"):
+                st.session_state.session_id = session.id
+                load_messages(db, session.id)
+                st.rerun()
+
+        st.divider()
+        if st.button("Logout"):
+            reset_login_state()
+            st.rerun()
+
+
+def render_messages():
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            if message.get("sources"):
+                with st.expander("Sources"):
+                    for source in message["sources"]:
+                        st.caption(f"{source.get('document_title', 'Unknown')} page {source.get('page', '?')}")
+                        st.markdown(f"> {source.get('content', '')[:300]}...")
+
+
 def app_page():
     with db_session() as db:
         user = current_user(db)
         if not user:
-            st.session_state.user_id = None
+            reset_login_state()
             st.rerun()
 
-        with st.sidebar:
-            st.markdown(f"**{user.full_name}**")
-            st.caption(user.email)
-
-            if not os.getenv("OPENAI_API_KEY"):
-                st.warning("Add OPENAI_API_KEY in Streamlit secrets before indexing documents.")
-
-            st.divider()
-            st.subheader("Upload Paper")
-            upload = st.file_uploader("PDF, TXT, or DOCX", type=["pdf", "txt", "docx"])
-            if upload and st.button("Upload & Index", type="primary"):
-                file = SimpleNamespace(filename=upload.name, file=io.BytesIO(upload.getvalue()))
-                try:
-                    doc = save_upload(db, file, user.id)
-                    with st.spinner("Indexing document..."):
-                        ingest_document_sync(doc.id, user.id)
-                    st.success("Document indexed.")
-                    st.rerun()
-                except Exception as exc:
-                    show_error("Upload failed", exc)
-
-            st.divider()
-            st.subheader("Documents")
-            for doc in get_user_documents(db, user.id):
-                status_icon = {
-                    DocumentStatus.INDEXED: "✓",
-                    DocumentStatus.PROCESSING: "…",
-                    DocumentStatus.PENDING: "○",
-                    DocumentStatus.FAILED: "!",
-                }.get(doc.status, "?")
-                left, right = st.columns([5, 1])
-                left.caption(f"{status_icon} {doc.title[:36]}")
-                if right.button("Delete", key=f"delete_doc_{doc.id}"):
-                    delete_document(db, doc.id, user.id)
-                    st.rerun()
-                if doc.error_message:
-                    st.caption(doc.error_message)
-
-            st.divider()
-            st.subheader("Chats")
-            if st.button("New Chat"):
-                session = chat_service.create_session(db, user.id, "New Chat")
-                st.session_state.session_id = session.id
-                st.session_state.messages = []
-                st.rerun()
-
-            for session in chat_service.get_user_sessions(db, user.id):
-                label = session.title[:32]
-                if session.id == st.session_state.session_id:
-                    label = f"› {label}"
-                if st.button(label, key=f"session_{session.id}"):
-                    st.session_state.session_id = session.id
-                    load_messages(db, session.id)
-                    st.rerun()
-
-            st.divider()
-            if st.button("Logout"):
-                for key in ("user_id", "user", "session_id", "messages"):
-                    st.session_state[key] = [] if key == "messages" else None
-                st.rerun()
+        sidebar(db, user)
 
         st.title("AI Research Copilot")
         if not st.session_state.session_id:
@@ -193,14 +210,7 @@ def app_page():
         if not st.session_state.messages:
             load_messages(db, st.session_state.session_id)
 
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
-                if message.get("sources"):
-                    with st.expander("Sources"):
-                        for source in message["sources"]:
-                            st.caption(f"{source.get('document_title', 'Unknown')} page {source.get('page', '?')}")
-                            st.markdown(f"> {source.get('content', '')[:300]}...")
+        render_messages()
 
         prompt = st.chat_input("Ask about your research papers...")
         if prompt:
