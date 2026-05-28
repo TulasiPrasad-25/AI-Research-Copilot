@@ -1,0 +1,123 @@
+version: "3.9"
+
+services:
+  # FastAPI Backend
+  api:
+    build: .
+    container_name: research_copilot_api
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - faiss_data:/app/faiss_index
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - copilot_network
+    command: >
+      sh -c "alembic -c /app/alembic.ini upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    restart: unless-stopped
+
+  # Celery Worker
+  celery_worker:
+    build: .
+    container_name: research_copilot_worker
+    command: celery -A app.tasks.worker worker --loglevel=info --concurrency=2
+    volumes:
+      - .:/app
+      - faiss_data:/app/faiss_index
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - copilot_network
+    restart: unless-stopped
+
+  # Celery Beat (scheduler)
+  celery_beat:
+    build: .
+    container_name: research_copilot_beat
+    command: celery -A app.tasks.worker beat --loglevel=info
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    networks:
+      - copilot_network
+    restart: unless-stopped
+
+  # PostgreSQL
+  db:
+    image: postgres:16-alpine
+    container_name: research_copilot_db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - copilot_network
+    restart: unless-stopped
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    container_name: research_copilot_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - copilot_network
+    restart: unless-stopped
+
+  # Streamlit Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: research_copilot_frontend
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      - API_BASE_URL=http://api:8000
+    depends_on:
+      - api
+    networks:
+      - copilot_network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  faiss_data:
+
+networks:
+  copilot_network:
+    driver: bridge
