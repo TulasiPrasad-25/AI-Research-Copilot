@@ -6,7 +6,6 @@ from app.models.user import User
 from app.schemas.document import DocumentOut, DocumentListOut
 from app.services.document_service import save_upload, get_user_documents, get_document, delete_document
 from app.services.ingestion_service import ingest_document_sync
-from app.tasks.ingest_document import ingest_document
 from app.core.config import settings
 
 router = APIRouter()
@@ -21,6 +20,8 @@ def upload_document(
 ):
     doc = save_upload(db, file, current_user.id)
     if settings.USE_CELERY:
+        from app.tasks.ingest_document import ingest_document
+
         ingest_document.delay(doc.id, current_user.id)
     else:
         background_tasks.add_task(ingest_document_sync, doc.id, current_user.id)

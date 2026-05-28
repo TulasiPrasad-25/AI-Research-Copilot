@@ -1,54 +1,102 @@
+import json
+import math
 import os
-from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings
-from langchain.schema import Document
-from typing import List
+from pathlib import Path
+
+import httpx
+
 from app.core.config import settings
+from app.rag.loader import Document
 
-INDEX_PATH = settings.FAISS_INDEX_PATH
+INDEX_PATH = Path(settings.FAISS_INDEX_PATH)
+EMBEDDING_MODEL = "text-embedding-3-small"
 
 
-def get_embeddings() -> OpenAIEmbeddings:
+def require_api_key() -> str:
     if not settings.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is required to index and search documents.")
-    return OpenAIEmbeddings(openai_api_key=settings.OPENAI_API_KEY)
+    return settings.OPENAI_API_KEY
 
 
-def get_index_path(user_id: int) -> str:
-    path = os.path.join(INDEX_PATH, str(user_id))
-    os.makedirs(path, exist_ok=True)
-    return path
+def get_index_path(user_id: int) -> Path:
+    path = INDEX_PATH / str(user_id)
+    path.mkdir(parents=True, exist_ok=True)
+    return path / "chunks.json"
 
 
-def add_documents(user_id: int, chunks: List[Document]) -> int:
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    api_key = require_api_key()
+    response = httpx.post(
+        "https://api.openai.com/v1/embeddings",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={"model": EMBEDDING_MODEL, "input": texts},
+        timeout=60,
+    )
+    response.raise_for_status()
+    data = response.json()["data"]
+    return [item["embedding"] for item in sorted(data, key=lambda item: item["index"])]
+
+
+def load_records(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def save_records(path: Path, records: list[dict]) -> None:
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(records, file)
+
+
+def add_documents(user_id: int, chunks: list[Document]) -> int:
     path = get_index_path(user_id)
-    index_file = os.path.join(path, "index.faiss")
-    embeddings = get_embeddings()
+    records = load_records(path)
+    texts = [chunk.page_content for chunk in chunks]
+    embeddings = embed_texts(texts)
 
-    if os.path.exists(index_file):
-        store = FAISS.load_local(path, embeddings, allow_dangerous_deserialization=True)
-        store.add_documents(chunks)
-    else:
-        store = FAISS.from_documents(chunks, embeddings)
+    for chunk, embedding in zip(chunks, embeddings):
+        records.append(
+            {
+                "content": chunk.page_content,
+                "metadata": chunk.metadata,
+                "embedding": embedding,
+            }
+        )
 
-    store.save_local(path)
+    save_records(path, records)
     return len(chunks)
 
 
-def similarity_search(user_id: int, query: str, k: int = 5) -> List[Document]:
-    path = get_index_path(user_id)
-    index_file = os.path.join(path, "index.faiss")
+def cosine_similarity(left: list[float], right: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if not left_norm or not right_norm:
+        return 0.0
+    return dot / (left_norm * right_norm)
 
-    if not os.path.exists(index_file):
+
+def similarity_search(user_id: int, query: str, k: int = 5) -> list[Document]:
+    path = get_index_path(user_id)
+    records = load_records(path)
+    if not records:
         return []
 
-    embeddings = get_embeddings()
-    store = FAISS.load_local(path, embeddings, allow_dangerous_deserialization=True)
-    return store.similarity_search(query, k=k)
+    query_embedding = embed_texts([query])[0]
+    ranked = sorted(
+        records,
+        key=lambda record: cosine_similarity(query_embedding, record["embedding"]),
+        reverse=True,
+    )
+
+    return [
+        Document(page_content=record["content"], metadata=record.get("metadata", {}))
+        for record in ranked[:k]
+    ]
 
 
 def delete_user_index(user_id: int):
-    import shutil
     path = get_index_path(user_id)
-    if os.path.exists(path):
-        shutil.rmtree(path)
+    if path.exists():
+        os.remove(path)

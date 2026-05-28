@@ -1,35 +1,45 @@
-from langchain_openai import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from langchain.schema import Document
-from typing import List
-from app.rag.vectorstore import similarity_search
+import httpx
+
 from app.core.config import settings
+from app.rag.loader import Document
+from app.rag.vectorstore import similarity_search
 
-PROMPT = ChatPromptTemplate.from_template("""
-You are an AI research assistant. Answer the question based on the provided context from research documents.
-Be precise, cite the sources, and if the answer is not in the context, say so clearly.
-
-Context:
-{context}
-
-Question: {question}
-
-Answer:
-""")
+CHAT_MODEL = "gpt-4o-mini"
 
 
-def get_llm() -> ChatOpenAI:
+def require_api_key() -> str:
     if not settings.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is required to answer questions.")
-    return ChatOpenAI(
-        model="gpt-4o",
-        temperature=0.2,
-        openai_api_key=settings.OPENAI_API_KEY,
+    return settings.OPENAI_API_KEY
+
+
+def answer_question(context: str, question: str) -> str:
+    api_key = require_api_key()
+    response = httpx.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={
+            "model": CHAT_MODEL,
+            "temperature": 0.2,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an AI research assistant. Answer only from the provided context. "
+                        "If the answer is not in the context, say that clearly. Cite source numbers."
+                    ),
+                },
+                {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
+            ],
+        },
+        timeout=60,
     )
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"]
 
 
 def run_rag_pipeline(user_id: int, question: str) -> dict:
-    docs: List[Document] = similarity_search(user_id, question, k=5)
+    docs: list[Document] = similarity_search(user_id, question, k=5)
 
     if not docs:
         return {
@@ -37,21 +47,21 @@ def run_rag_pipeline(user_id: int, question: str) -> dict:
             "sources": [],
         }
 
-    context = "\n\n".join([f"[{i+1}] {doc.page_content}" for i, doc in enumerate(docs)])
-
-    chain = PROMPT | get_llm()
-    response = chain.invoke({"context": context, "question": question})
+    context = "\n\n".join([f"[{index + 1}] {doc.page_content}" for index, doc in enumerate(docs)])
+    answer = answer_question(context, question)
 
     sources = []
     for doc in docs:
         meta = doc.metadata
-        sources.append({
-            "content": doc.page_content[:300],
-            "document_title": meta.get("document_title") or meta.get("source", "Unknown"),
-            "page": meta.get("page", None),
-        })
+        sources.append(
+            {
+                "content": doc.page_content[:300],
+                "document_title": meta.get("document_title") or meta.get("source", "Unknown"),
+                "page": meta.get("page", None),
+            }
+        )
 
     return {
-        "answer": response.content,
+        "answer": answer,
         "sources": sources,
     }

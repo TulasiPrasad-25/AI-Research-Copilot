@@ -77,7 +77,7 @@ app/
   api/          FastAPI routes
   core/         config, database, security
   models/       SQLAlchemy models
-  rag/          loaders, splitters, FAISS, OpenAI pipeline
+  rag/          document loaders, text splitter, JSON vector store, OpenAI HTTP pipeline
   services/     auth, document, chat, and ingestion logic
   tasks/        optional Celery task wrapper
 frontend/       legacy API-driven Streamlit frontend
